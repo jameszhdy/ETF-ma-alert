@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_market_alerts.py
-- 从 watch_config.json 读取需要盯盘的场内品种（股票/ETF/指数）
-- 优先使用东方财富 push2his 接口拉日线（尝试 secid=1.code / 0.code）
-- 计算每个品种最近收盘价与 MA（可全局配置或单品种覆盖）
-- 若最新价 < MA，则通过 Server酱 或 企业微信 webhook 推送提醒
-- 可在 watch_config.json 中自由增删品种、调整MA天数、调整回溯天数
+run_market_alerts.py (增强版)
+- 优先使用东财 push2his（日线）
+- 若东财返回空/失败，回退尝试 akshare（需在 requirements.txt 中安装 akshare）
+- 更详细的调试日志（当东财返回空时记录返回片段）
+- 单品种失败不会使整个任务退出
 """
 import os
 import json
@@ -14,12 +13,18 @@ import time
 import logging
 import argparse
 import datetime as dt
-from io import StringIO
-from typing import Dict, List
+from typing import List, Dict
 
 import requests
 import pandas as pd
 import numpy as np
+
+# 尝试导入 akshare 作为后备
+try:
+    import akshare as ak
+    HAS_AKSHARE = True
+except Exception:
+    HAS_AKSHARE = False
 
 LOG = logging.getLogger("market_alerts")
 LOG.setLevel(logging.INFO)
@@ -34,53 +39,64 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 }
 
+
 def load_config(path=CONFIG_PATH) -> dict:
     if not os.path.exists(path):
-        raise FileNotFoundError(f"配置文件{path} 未找到，请参考 README 新建。")
+        raise FileNotFoundError(f"配置文件 {path} 未找到")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ------------------ 抓取函数（东方财富 push2his） ------------------
+
+# ---------- 东财 push2his 抓取（主） ----------
 def fetch_from_eastmoney_kline(code: str, start_date: str, end_date: str, timeout=10) -> pd.Series:
     """
-    优先尝试 secid = 1.code（上交所），若无结果再尝试 secid = 0.code（深交所）
-    返回 pd.Series，index 为日期（datetime），值为收盘价（float）。
-    start_date / end_date 格式 'YYYYMMDD'
+    尝试调用东财 push2his API，先尝试 secid=1.code（上交所），若空再尝试 secid=0.code（深交所）
+    返回：pd.Series(index 日期, value 收盘价)
+    start_date/end_date 格式 YYYYMMDD
     """
     base = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params_template = {
-        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-        # fields2 可以留空或默认（我们只解析 klines 字段）
         "beg": start_date,
         "end": end_date,
         "rtntype": "6",
         "klt": "101",   # 日线
-        "fqt": "1"      # 复权方式：1 前复权（你可改为 0 不复权）
+        "fqt": "1"
     }
 
+    last_resp_text = None
     last_exc = None
-    for market_prefix in ("1", "0"):   # 首试 1.code 再试 0.code
+    for market_prefix in ("1", "0"):
         secid = f"{market_prefix}.{code}"
         params = dict(params_template)
         params["secid"] = secid
+        headers = HEADERS.copy()
+        headers["Referer"] = f"https://quote.eastmoney.com/{code}.html"
         try:
-            r = requests.get(base, params=params, headers=HEADERS, timeout=timeout)
-            r.raise_for_status()
+            r = requests.get(base, params=params, headers=headers, timeout=timeout)
+            # 先记录状态码
+            if r.status_code != 200:
+                last_resp_text = f"HTTP {r.status_code}"
+                last_exc = Exception(f"HTTP {r.status_code}")
+                LOG.debug("东财 %s 返回状态码 %s", secid, r.status_code)
+                time.sleep(0.15)
+                continue
+            # 解析 JSON
             j = r.json()
             data = j.get("data") or {}
             klines = data.get("klines") or []
+            # 记录响应片段（调试用）
+            last_resp_text = r.text[:2000]
             if not klines:
-                # 无数据，继续尝试下一个 secid
+                LOG.debug("东财 %s 返回但 klines 为空（响应前2000字符）: %s", secid, last_resp_text[:500])
+                time.sleep(0.15)
                 continue
 
             dates = []
             closes = []
             for k in klines:
-                # k 通常是逗号分隔的字符串，格式示例: "20250930,open,close,high,low,volume,amount,..."
                 parts = k.split(",")
                 if not parts:
                     continue
-                # 解析日期：可能是 '20250930' 或 '2025-09-30'
                 raw_date = parts[0].strip()
                 try:
                     if "-" in raw_date:
@@ -88,9 +104,7 @@ def fetch_from_eastmoney_kline(code: str, start_date: str, end_date: str, timeou
                     else:
                         d = pd.to_datetime(raw_date, format="%Y%m%d")
                 except Exception:
-                    # 如果解析失败，跳过
                     continue
-                # 解析收盘价（按常见格式：parts[2] 为收盘价；若无则尝试 parts[1]）
                 close = None
                 for idx in (2, 1, 3, 4):
                     if len(parts) > idx:
@@ -105,40 +119,95 @@ def fetch_from_eastmoney_kline(code: str, start_date: str, end_date: str, timeou
                 closes.append(close)
 
             if len(closes) == 0:
+                LOG.debug("东财 %s klines 存在但未解析出价格", secid)
+                time.sleep(0.15)
                 continue
 
             series = pd.Series(closes, index=pd.to_datetime(dates)).sort_index()
             return series
         except Exception as e:
             last_exc = e
-            LOG.debug("东财抓取 %s (%s) 异常: %s", code, secid, e)
+            LOG.debug("东财请求 %s 异常: %s", secid, e)
             time.sleep(0.15)
             continue
 
-    raise RuntimeError(f"未能通过东财 push2his 获取 {code} 的日线数据（最后异常：{last_exc}）")
+    # 如果走到这里，东财未返回有效 klines
+    raise RuntimeError(f"未能通过东财 push2his 获取 {code} 的日线数据（最后响应片段：{str(last_resp_text)[:300]}，最后异常：{last_exc})")
 
-# ------------------ 批量拉取工具 ------------------
+
+# ---------- akshare 回退（如果安装了 akshare） ----------
+def fetch_from_akshare(code: str, start_date: str, end_date: str) -> pd.Series:
+    """
+    使用 akshare 抓取 A 股日线（适用于股票/ETF）
+    code: 纯数字代码，如 511020
+    start_date/end_date: YYYYMMDD
+    """
+    if not HAS_AKSHARE:
+        raise RuntimeError("akshare 未安装")
+    # 简单根据首位判断上/深（经验规则）：以 6 开头/51/50 等为上交所，否则为深交所
+    sh_prefixes = ("5", "6", "9")  # 9xx 可能是科创/其他（部分情况）
+    prefix = "sh" if code.startswith(sh_prefixes) else "sz"
+    symbol = f"{prefix}{code}"
+    try:
+        # ak.stock_zh_a_daily 常用接口（akshare 版本差异可能存在）
+        # 尝试多种 akshare 函数/字段兼容性
+        df = ak.stock_zh_a_daily(symbol=symbol, start_date=start_date, end_date=end_date)
+        if df is None or df.empty:
+            # 有时 akshare 返回 columns['date','open','close'...] 或 index 为 date
+            raise RuntimeError("akshare 返回空数据")
+        # 支持多种字段名
+        if "close" in df.columns:
+            ser = pd.Series(df["close"].values, index=pd.to_datetime(df["date"] if "date" in df.columns else df.index))
+        elif "收盘" in df.columns:
+            ser = pd.Series(df["收盘"].values, index=pd.to_datetime(df["日期"] if "日期" in df.columns else df.index))
+        else:
+            # 选择第一个浮点列作为价格列
+            float_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not float_cols:
+                raise RuntimeError("akshare 返回无数值列")
+            ser = pd.Series(df[float_cols[0]].values, index=pd.to_datetime(df.index))
+        ser.index = pd.to_datetime(ser.index).normalize()
+        ser = ser.sort_index()
+        return ser
+    except Exception as e:
+        raise RuntimeError(f"akshare 抓取失败: {e}")
+
+
+# ---------- 批量抓取（先东财，失败再 akshare） ----------
 def fetch_series_for_codes(codes: List[str], start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
     start_s = start_date.strftime("%Y%m%d")
     end_s = end_date.strftime("%Y%m%d")
     series_list = []
     for c in codes:
         LOG.info("拉取 %s: %s -> %s", c, start_s, end_s)
+        s = None
+        # 1）试东财
         try:
             s = fetch_from_eastmoney_kline(c, start_s, end_s)
+            LOG.info(" 东财成功: %s 获得 %d 行", c, len(s))
+        except Exception as e:
+            LOG.warning(" 东财失败: %s (尝试回退 akshare) 详细: %s", c, e)
+            # 2）回退 akshare
+            try:
+                s = fetch_from_akshare(c, start_s, end_s)
+                LOG.info(" akshare 回退成功: %s 获得 %d 行", c, len(s))
+            except Exception as e2:
+                LOG.error(" akshare 也失败: %s", e2)
+                s = None
+        if s is not None and len(s) > 0:
             s.name = c
             series_list.append(s)
-            time.sleep(0.2)
-        except Exception as e:
-            LOG.error(" 拉取 %s 失败: %s", c, e)
-            continue
+        else:
+            LOG.error(" 拉取 %s 失败: 未能获取任何日线数据", c)
+        time.sleep(0.2)
     if not series_list:
         raise ValueError("没有任何品种成功获取数据。")
     df = pd.concat(series_list, axis=1).sort_index()
     df.index = pd.to_datetime(df.index).normalize()
     return df
 
-# ------------------ 推送（Server酱） ------------------
+
+# ---------- 推送（Server酱 / 企业微信） ----------
 def send_serverchan(sckey: str, title: str, desp: str) -> bool:
     url = f"https://sctapi.ftqq.com/{sckey}.send"
     payload = {"title": title, "desp": desp}
@@ -150,19 +219,20 @@ def send_serverchan(sckey: str, title: str, desp: str) -> bool:
         LOG.error("Server酱发送失败: %s", e)
         return False
 
+
 def send_notifications(title: str, body: str):
     sckey = os.environ.get("SERVERCHAN_SCKEY") or os.environ.get("SERVERCHAN_SCKEY_TURBO")
-    wechat_webhook = os.environ.get("WECHAT_WEBHOOK")  # 仍保留企业微信备用
+    wechat_webhook = os.environ.get("WECHAT_WEBHOOK")
     wechat_secret = os.environ.get("WECHAT_SECRET")
     ok = False
     if sckey:
         LOG.info("使用 Server酱 发送提醒")
         ok = send_serverchan(sckey, title, body)
-    # 如果你也配置了企业微信 webhook，可以用下面的逻辑（我们在前面的对话里已经实现过）
     if not ok and wechat_webhook:
-        from urllib.parse import quote_plus
-        import hmac, hashlib, base64
+        # 企业微信回退（加签支持）
         try:
+            from urllib.parse import quote_plus
+            import hmac, hashlib, base64
             url = wechat_webhook
             if wechat_secret:
                 timestamp = str(int(time.time() * 1000))
@@ -180,11 +250,11 @@ def send_notifications(title: str, body: str):
         except Exception as e:
             LOG.error("企业微信发送失败: %s", e)
             ok = False
-
     if not ok:
         LOG.warning("未发送任何提醒（未配置或发送失败）。")
 
-# ------------------ 主逻辑 ------------------
+
+# ---------- 主逻辑 ----------
 def main(debug=False):
     if debug:
         LOG.setLevel(logging.DEBUG)
@@ -194,7 +264,7 @@ def main(debug=False):
     fetch_days_back = int(cfg.get("fetch_days_back", 400))
     instruments: Dict[str, dict] = cfg.get("instruments", {})
     if not instruments:
-        LOG.error("配置文件中未找到 instruments，请编辑 watch_config.json")
+        LOG.error("配置文件中未找到 instruments")
         return
 
     codes = list(instruments.keys())
@@ -212,20 +282,16 @@ def main(debug=False):
     for code, meta in instruments.items():
         name = meta.get("name", code)
         ma_days = int(meta.get("ma", ma_default))
-        # 如果该 code 没数据，跳过但记录
         if code not in nav_df.columns:
             LOG.warning("%s (%s) 没有价格数据，跳过", name, code)
             continue
-
         s = nav_df[code].dropna()
         if s.empty:
             LOG.warning("%s (%s) 全为空，跳过", name, code)
             continue
 
-        # 计算 normalized price (直接按收盘价)
         price_series = s
         ma_series = price_series.rolling(ma_days, min_periods=ma_days).mean()
-
         last_price = float(price_series.iloc[-1])
         last_ma = float(ma_series.iloc[-1]) if not pd.isna(ma_series.iloc[-1]) else None
         last_date = price_series.index[-1].date()
@@ -251,6 +317,6 @@ def main(debug=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="输出调试日志")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     main(debug=args.debug)
