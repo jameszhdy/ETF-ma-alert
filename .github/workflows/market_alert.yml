@@ -1,0 +1,31 @@
+name: Market MA Scan
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # UTC 04:00 = 北京时间 12:00
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      SERVERCHAN_SCKEY: ${{ secrets.SERVERCHAN_SCKEY }}
+      SERVERCHAN_SCKEY_TURBO: ${{ secrets.SERVERCHAN_SCKEY_TURBO }}
+      WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+      WECHAT_SECRET: ${{ secrets.WECHAT_SECRET }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run market MA scan
+        run: python run_market_alerts.py
